@@ -21,6 +21,7 @@ def parse_args():
     parser.add_argument("-p", "--photo_dir", dest="photo_dir", type=str, required=True, help="Path to the folder containing aerial/ground photos.")
     parser.add_argument("-o", "--output_dir", dest="output_dir", type=str, default="./GCP_Photo_Output", help="Path where organized folders and reports will be saved.")
     parser.add_argument("-b", "--buffer_distance", dest="buffer_distance", type=float, default=50.0, help="Buffer radius in meters for spatial matching (default: 50.0).")
+    parser.add_argument("-t", "--time-window", dest="time_window", type=int, default=300, help="Maximum allowed time difference in seconds between photo and GCP timestamp.")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="Run the spatial analysis without copying or modifying files.")
     parser.add_argument("--copy-mode", dest="copy_mode", choices=['copy', 'move'], default='copy', help="Choose whether to duplicate photos into GCP folders or move them.")
     parser.add_argument("--force", action="store_true", help="Suppress interactive warning if output_dir already exists.")
@@ -248,6 +249,7 @@ Configuration:
   Photo Directory : {args.photo_dir}
   Output Directory: {args.output_dir}
   Buffer Distance : {args.buffer_distance} meters
+  Time Window     : {args.time_window} seconds
   Copy Mode       : {args.copy_mode}
   Dry Run         : {'Yes' if args.dry_run else 'No'}
 ============================================================
@@ -266,36 +268,53 @@ def main():
 
     unmatched_dir = output_dir / "Inconnect_photo"
     no_gps_dir = unmatched_dir / "No_GPS"
+    out_of_range_dir = unmatched_dir / "Out_of_Range"
+    time_mismatch_dir = unmatched_dir / "Time_Mismatch"
+    manual_calibration_dir = output_dir / "Manual_Calibration"
+
+    gcp_df, pre_dedup_count, post_dedup_count = process_excel_files(excel_files)
+    dedup_removed = pre_dedup_count - post_dedup_count
 
     if not args.dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
         unmatched_dir.mkdir(parents=True, exist_ok=True)
         no_gps_dir.mkdir(parents=True, exist_ok=True)
+        out_of_range_dir.mkdir(parents=True, exist_ok=True)
+        time_mismatch_dir.mkdir(parents=True, exist_ok=True)
+        manual_calibration_dir.mkdir(parents=True, exist_ok=True)
 
-    gcp_df, pre_dedup_count, post_dedup_count = process_excel_files(excel_files)
-    dedup_removed = pre_dedup_count - post_dedup_count
+        # 1. Strict Folder Scaffolding
+        for idx, row in gcp_df.iterrows():
+            gcp_id = row['ID']
+            gcp_folder = output_dir / f"GCP_{gcp_id}"
+            gcp_folder.mkdir(parents=True, exist_ok=True)
 
     total_photos = len(photos)
-    photos_matched_count = 0
-    unmatched_photos_count = 0
+    status_counts = {
+        "NO_GPS": 0,
+        "OUT_OF_RANGE": 0,
+        "TIME_MISMATCH": 0,
+        "MATCHED": 0,
+        "CONFLICT": 0
+    }
+
     matched_dict = {row['ID']: [] for _, row in gcp_df.iterrows()}
+    conflict_dict = {row['ID']: [] for _, row in gcp_df.iterrows()}
 
-    # TQDM Bar 2: EXIF extraction and distance calculation
-    # We will also queue up copy operations for Bar 3
-    copy_queue = [] # list of tuples: (source_path, dest_path, is_unmatched, gcp_id)
+    copy_queue = [] # list of tuples: (source_path, dest_path)
 
-    for photo_path in tqdm(photos, desc="Scanning EXIF & Calculating Distances"):
+    for photo_path in tqdm(photos, desc="Evaluating Photos"):
         lat, lon = get_gps_from_exif(photo_path)
+        photo_time = get_photo_datetime(photo_path)
 
         if lat is None or lon is None:
-            # No GPS
-            copy_queue.append((photo_path, no_gps_dir / photo_path.name, True, None))
-            unmatched_photos_count += 1
+            status_counts["NO_GPS"] += 1
+            copy_queue.append((photo_path, no_gps_dir / photo_path.name))
             continue
 
-        matched_any = False
+        spatial_candidates = []
 
-        # Check against all GCPs
+        # Find spatial candidates
         for idx, row in gcp_df.iterrows():
             gcp_lat = row['latitude']
             gcp_lon = row['longitude']
@@ -310,62 +329,79 @@ def main():
                 continue
 
             dist = geodesic((lat, lon), (gcp_lat, gcp_lon)).meters
-
             if dist <= args.buffer_distance:
-                matched_any = True
-                gcp_id = row['ID']
-                gcp_name = row['point_name']
+                spatial_candidates.append(row)
 
-                # Queue matched copy
-                gcp_folder = output_dir / f"GCP_{gcp_id}_{gcp_name}"
-                dest_name = f"GCP_{gcp_id}_{photo_path.name}"
-                copy_queue.append((photo_path, gcp_folder / dest_name, False, gcp_id))
+        if not spatial_candidates:
+            status_counts["OUT_OF_RANGE"] += 1
+            copy_queue.append((photo_path, out_of_range_dir / photo_path.name))
+            continue
 
-        if matched_any:
-            photos_matched_count += 1
+        # Evaluate temporal criteria among spatial candidates
+        valid_candidates = []
+        for row in spatial_candidates:
+            gcp_time = row['Recorded at']
+            if pd.isna(gcp_time) or photo_time is None:
+                # If either time is missing, we might assume it's valid to be safe,
+                # but to be strict based on the requirement, if they can't calculate dt, we skip or include?
+                # The task says: "calculate |Delta t|. Keep only candidates where |Delta t| <= time_window."
+                # If we don't have time, it can't satisfy this.
+                pass
+            else:
+                time_diff = abs((photo_time - gcp_time).total_seconds())
+                if time_diff <= args.time_window:
+                    valid_candidates.append(row)
+
+        if not valid_candidates:
+            status_counts["TIME_MISMATCH"] += 1
+            copy_queue.append((photo_path, time_mismatch_dir / photo_path.name))
+            continue
+
+        # Arbitration
+        if len(valid_candidates) == 1:
+            gcp_id = valid_candidates[0]['ID']
+            matched_dict[gcp_id].append(photo_path.name)
+            status_counts["MATCHED"] += 1
+            gcp_folder = output_dir / f"GCP_{gcp_id}"
+            copy_queue.append((photo_path, gcp_folder / photo_path.name))
         else:
-            # Unmatched
-            copy_queue.append((photo_path, unmatched_dir / photo_path.name, True, None))
-            unmatched_photos_count += 1
+            gcp_ids = [row['ID'] for row in valid_candidates]
+            status_counts["CONFLICT"] += 1
+            copy_queue.append((photo_path, manual_calibration_dir / photo_path.name))
+            for cid in gcp_ids:
+                conflict_dict[cid].append(photo_path.name)
 
-    # TQDM Bar 3: Copying/Moving files
-    generated_copies_count = 0
-    moved_sources = set()
-
+    # File Distribution
     if not args.dry_run:
-        for src, dest, is_unmatched, gcp_id in tqdm(copy_queue, desc="Copying/Moving Photos"):
-            dest.parent.mkdir(parents=True, exist_ok=True)
-
-            # Always copy to ensure we don't break if a photo matches multiple GCPs
+        for src, dest in tqdm(copy_queue, desc="Copying/Moving Photos"):
             shutil.copy2(src, dest)
             if args.copy_mode == 'move':
-                moved_sources.add(src)
-
-            if not is_unmatched and gcp_id is not None:
-                matched_dict[gcp_id].append(src.name)
-                generated_copies_count += 1
-
-        # Clean up source files if in move mode
-        if args.copy_mode == 'move':
-            for src in moved_sources:
                 if src.exists():
                     src.unlink()
-    else:
-        # Just populate matched_dict based on queue for dry-run report
-        for src, dest, is_unmatched, gcp_id in copy_queue:
-            if not is_unmatched and gcp_id is not None:
-                matched_dict[gcp_id].append(src.name)
-                generated_copies_count += 1
 
     # Update DataFrame with results
     matched_gcps_count = 0
+    gcp_df['PhotoCheck_Or_Not'] = 'No'
+    gcp_df['Matched_Count'] = 0
+    gcp_df['Matched_Photos'] = ''
+    gcp_df['Conflict_Photos'] = ''
+
     for idx, row in gcp_df.iterrows():
         gcp_id = row['ID']
-        matched_photos = matched_dict[gcp_id]
-        if matched_photos:
+        m_photos = matched_dict[gcp_id]
+        c_photos = conflict_dict[gcp_id]
+
+        gcp_df.at[idx, 'Matched_Count'] = len(m_photos)
+
+        if m_photos:
+            gcp_df.at[idx, 'Matched_Photos'] = ', '.join(m_photos)
             gcp_df.at[idx, 'PhotoCheck_Or_Not'] = 'Yes'
-            gcp_df.at[idx, 'Matched_Photos'] = ', '.join(matched_photos)
             matched_gcps_count += 1
+        elif c_photos:
+            gcp_df.at[idx, 'PhotoCheck_Or_Not'] = 'Conflict'
+
+        if c_photos:
+            gcp_df.at[idx, 'Conflict_Photos'] = ', '.join(c_photos)
 
     # Export Report
     today_str = datetime.now().strftime("%Y%m%d")
@@ -385,12 +421,14 @@ def main():
     print(f"Final GCP Points Processed      : {len(gcp_df)}")
     print("-" * 60)
     print(f"Total Photos Scanned            : {total_photos}")
+    print(f"Photos NO_GPS                   : {status_counts['NO_GPS']}")
+    print(f"Photos OUT_OF_RANGE             : {status_counts['OUT_OF_RANGE']}")
+    print(f"Photos TIME_MISMATCH            : {status_counts['TIME_MISMATCH']}")
+    print(f"Photos MATCHED (Unique GCP)     : {status_counts['MATCHED']}")
+    print(f"Photos CONFLICT (>1 Valid GCP)  : {status_counts['CONFLICT']}")
+    print("-" * 60)
     print(f"Points with Matching Photos     : {matched_gcps_count}")
     print(f"Points with ZERO Photos         : {points_no_photos}")
-    print("-" * 60)
-    print(f"Matched Photos Count (Unique)   : {photos_matched_count}")
-    print(f"Matched Photos (Total Copies)   : {generated_copies_count}")
-    print(f"Unmatched Photos Count          : {unmatched_photos_count}")
     print("="*60)
     if args.dry_run:
         print("Dry run enabled. No report exported.")
