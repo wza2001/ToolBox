@@ -1,0 +1,8 @@
+<OGRVRTDataSource>
+    <OGRVRTLayer name="clean_undulation">
+        <SrcDataSource relativeToVRT="1">clean_undulation.csv</SrcDataSource>
+        <GeometryType>wkbPoint</GeometryType>
+        <LayerSRS>EPSG:4326</LayerSRS>
+        <GeometryField encoding="PointFromColumns" x="lon" y="lat" z="n"/>
+    </OGRVRTLayer>
+</OGRVRTDataSource>
