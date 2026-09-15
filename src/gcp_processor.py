@@ -1,32 +1,41 @@
+import sys
 import argparse
 import pandas as pd
 import math
 from pathlib import Path
 from datetime import datetime
 import shutil
-import exifread
 from geopy.distance import geodesic
 from tqdm import tqdm
+from PIL import Image
+from PIL.ExifTags import GPSTAGS, TAGS
+from pillow_heif import register_heif_opener
+
+# Enable HEIC support in Pillow
+register_heif_opener()
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Process GCPs and categorize photos based on distance.")
-    parser.add_argument("--excel_dir", type=str, required=True, help="Directory containing Excel files.")
-    parser.add_argument("--photo_dir", type=str, required=True, help="Directory containing photos.")
-    parser.add_argument("--output_dir", type=str, required=True, help="Output directory for categorized outputs.")
-    parser.add_argument("--buffer_distance", type=float, default=50.0, help="Buffer threshold in meters (default: 50.0).")
+    parser = argparse.ArgumentParser(description="GCP-Photo Matching Tool")
+    # Restore original argument names for backwards compatibility, but keep shorthand options
+    parser.add_argument("-e", "--excel_dir", dest="excel_dir", type=str, required=True, help="Path to the folder containing GCP Excel files (.xlsx, .xls).")
+    parser.add_argument("-p", "--photo_dir", dest="photo_dir", type=str, required=True, help="Path to the folder containing aerial/ground photos.")
+    parser.add_argument("-o", "--output_dir", dest="output_dir", type=str, default="./GCP_Photo_Output", help="Path where organized folders and reports will be saved.")
+    parser.add_argument("-b", "--buffer_distance", dest="buffer_distance", type=float, default=50.0, help="Buffer radius in meters for spatial matching (default: 50.0).")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="Run the spatial analysis without copying or modifying files.")
+    parser.add_argument("--copy-mode", dest="copy_mode", choices=['copy', 'move'], default='copy', help="Choose whether to duplicate photos into GCP folders or move them.")
+    parser.add_argument("--force", action="store_true", help="Suppress interactive warning if output_dir already exists.")
     return parser.parse_args()
 
-def dms_to_decimal(tags, ref_tag, val_tag):
-    if ref_tag not in tags or val_tag not in tags:
+def dms_to_decimal(val, ref):
+    if not val or not ref:
         return None
     try:
-        ref = tags[ref_tag].values
-        val = tags[val_tag].values
+        d, m, s = val
 
-        # Guard against zero division
-        d = float(val[0].num) / float(val[0].den) if val[0].den != 0 else 0
-        m = float(val[1].num) / float(val[1].den) if val[1].den != 0 else 0
-        s = float(val[2].num) / float(val[2].den) if val[2].den != 0 else 0
+        # PIL IFDRational handling
+        d = float(d) if hasattr(d, 'real') else float(d[0]) / float(d[1])
+        m = float(m) if hasattr(m, 'real') else float(m[0]) / float(m[1])
+        s = float(s) if hasattr(s, 'real') else float(s[0]) / float(s[1])
 
         decimal = d + (m / 60.0) + (s / 3600.0)
         if ref in ['S', 'W']:
@@ -37,11 +46,23 @@ def dms_to_decimal(tags, ref_tag, val_tag):
 
 def get_gps_from_exif(image_path):
     try:
-        with open(image_path, 'rb') as f:
-            tags = exifread.process_file(f, details=False)
+        with Image.open(image_path) as img:
+            exif = img.getexif()
+            if not exif:
+                return None, None
 
-            lat = dms_to_decimal(tags, 'GPS GPSLatitudeRef', 'GPS GPSLatitude')
-            lon = dms_to_decimal(tags, 'GPS GPSLongitudeRef', 'GPS GPSLongitude')
+            gps_info = exif.get_ifd(0x8825) # 0x8825 is the GPS IFD
+
+            if not gps_info:
+                return None, None
+
+            gps_tags = {}
+            for tag, value in gps_info.items():
+                decoded = GPSTAGS.get(tag, tag)
+                gps_tags[decoded] = value
+
+            lat = dms_to_decimal(gps_tags.get('GPSLatitude'), gps_tags.get('GPSLatitudeRef'))
+            lon = dms_to_decimal(gps_tags.get('GPSLongitude'), gps_tags.get('GPSLongitudeRef'))
 
             if lat is not None and lon is not None:
                 return lat, lon
@@ -49,15 +70,11 @@ def get_gps_from_exif(image_path):
         pass
     return None, None
 
-def process_excel_files(excel_dir):
-    excel_dir_path = Path(excel_dir)
-    all_files = list(excel_dir_path.glob("*.xlsx")) + list(excel_dir_path.glob("*.xls"))
-
-    if not all_files:
-        raise ValueError(f"No Excel files found in {excel_dir}")
-
+def process_excel_files(excel_files):
     df_list = []
-    for f in all_files:
+
+    # Progress Bar 1: Reading and deduplicating Excel files
+    for f in tqdm(excel_files, desc="Reading Excel Files"):
         try:
             df = pd.read_excel(f)
             df_list.append(df)
@@ -92,7 +109,9 @@ def process_excel_files(excel_dir):
     core_cols = ['ID', 'point_name', 'latitude', 'longitude', 'altitude', 'north', 'east', 'Recorded at']
 
     # Deduplicate
+    pre_dedup_count = len(merged_df)
     merged_df = merged_df.drop_duplicates(subset=['point_name', 'latitude', 'longitude'])
+    post_dedup_count = len(merged_df)
 
     # Add ID
     merged_df.insert(0, 'ID', range(1, len(merged_df) + 1))
@@ -108,43 +127,96 @@ def process_excel_files(excel_dir):
     merged_df['PhotoCheck_Or_Not'] = 'No'
     merged_df['Matched_Photos'] = ''
 
-    return merged_df
+    return merged_df, pre_dedup_count, post_dedup_count
+
+def check_preflight(excel_dir, photo_dir, output_dir, force):
+    # 1. Verify directories exist
+    if not excel_dir.exists() or not excel_dir.is_dir():
+        print(f"Error: Excel directory '{excel_dir}' does not exist or is not a directory.")
+        sys.exit(1)
+    if not photo_dir.exists() or not photo_dir.is_dir():
+        print(f"Error: Photo directory '{photo_dir}' does not exist or is not a directory.")
+        sys.exit(1)
+
+    # 2. Check for Excel files
+    excel_files = list(excel_dir.glob("*.xlsx")) + list(excel_dir.glob("*.xls"))
+    if not excel_files:
+        print(f"Error: No Excel files (.xlsx, .xls) found in '{excel_dir}'.")
+        sys.exit(1)
+
+    # 3. Check for valid image files
+    photo_extensions = {".jpg", ".jpeg", ".heic", ".heif"}
+    photos = [p for p in photo_dir.rglob("*") if p.is_file() and p.suffix.lower() in photo_extensions]
+    if not photos:
+        print(f"Error: No valid image files (.jpg, .jpeg, .heic, .heif) found in '{photo_dir}'.")
+        sys.exit(1)
+
+    # 4. Prompt if output_dir exists and is non-empty
+    if output_dir.exists() and any(output_dir.iterdir()) and not force:
+        # Check if we're connected to a terminal to avoid hanging automated scripts
+        if sys.stdin.isatty():
+            response = input(f"Warning: Output directory '{output_dir}' already exists and is non-empty.\nDo you want to overwrite/append? [y/N]: ")
+            if response.lower() not in ['y', 'yes']:
+                print("Operation aborted by user.")
+                sys.exit(0)
+        else:
+            print(f"Error: Output directory '{output_dir}' already exists and is non-empty. Use --force to overwrite in automated environments.")
+            sys.exit(1)
+
+    return excel_files, photos
+
+def print_banner(args):
+    banner = f"""
+============================================================
+              GCP-Photo Matching Tool CLI
+============================================================
+Configuration:
+  Excel Directory : {args.excel_dir}
+  Photo Directory : {args.photo_dir}
+  Output Directory: {args.output_dir}
+  Buffer Distance : {args.buffer_distance} meters
+  Copy Mode       : {args.copy_mode}
+  Dry Run         : {'Yes' if args.dry_run else 'No'}
+============================================================
+"""
+    print(banner)
 
 def main():
     args = parse_args()
+    print_banner(args)
 
     excel_dir = Path(args.excel_dir)
     photo_dir = Path(args.photo_dir)
     output_dir = Path(args.output_dir)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    excel_files, photos = check_preflight(excel_dir, photo_dir, output_dir, args.force)
+
     unmatched_dir = output_dir / "Inconnect_photo"
     no_gps_dir = unmatched_dir / "No_GPS"
 
-    unmatched_dir.mkdir(exist_ok=True)
-    no_gps_dir.mkdir(exist_ok=True)
+    if not args.dry_run:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        unmatched_dir.mkdir(parents=True, exist_ok=True)
+        no_gps_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Processing Excel files...")
-    gcp_df = process_excel_files(excel_dir)
-
-    # List all photos
-    photo_extensions = {".jpg", ".jpeg"}
-    photos = [p for p in photo_dir.rglob("*") if p.is_file() and p.suffix.lower() in photo_extensions]
+    gcp_df, pre_dedup_count, post_dedup_count = process_excel_files(excel_files)
+    dedup_removed = pre_dedup_count - post_dedup_count
 
     total_photos = len(photos)
     photos_matched_count = 0
     unmatched_photos_count = 0
-
     matched_dict = {row['ID']: [] for _, row in gcp_df.iterrows()}
 
-    print(f"Found {total_photos} photos. Processing...")
+    # TQDM Bar 2: EXIF extraction and distance calculation
+    # We will also queue up copy operations for Bar 3
+    copy_queue = [] # list of tuples: (source_path, dest_path, is_unmatched, gcp_id)
 
-    for photo_path in tqdm(photos, desc="Processing Photos"):
+    for photo_path in tqdm(photos, desc="Scanning EXIF & Calculating Distances"):
         lat, lon = get_gps_from_exif(photo_path)
 
         if lat is None or lon is None:
             # No GPS
-            shutil.copy2(photo_path, no_gps_dir / photo_path.name)
+            copy_queue.append((photo_path, no_gps_dir / photo_path.name, True, None))
             unmatched_photos_count += 1
             continue
 
@@ -155,7 +227,6 @@ def main():
             gcp_lat = row['latitude']
             gcp_lon = row['longitude']
 
-            # Skip if invalid GCP coordinates
             if pd.isna(gcp_lat) or pd.isna(gcp_lon):
                 continue
 
@@ -172,21 +243,46 @@ def main():
                 gcp_id = row['ID']
                 gcp_name = row['point_name']
 
-                # Copy to matched folder
+                # Queue matched copy
                 gcp_folder = output_dir / f"GCP_{gcp_id}_{gcp_name}"
-                gcp_folder.mkdir(exist_ok=True)
-
                 dest_name = f"GCP_{gcp_id}_{photo_path.name}"
-                shutil.copy2(photo_path, gcp_folder / dest_name)
-
-                matched_dict[gcp_id].append(photo_path.name)
+                copy_queue.append((photo_path, gcp_folder / dest_name, False, gcp_id))
 
         if matched_any:
             photos_matched_count += 1
         else:
             # Unmatched
-            shutil.copy2(photo_path, unmatched_dir / photo_path.name)
+            copy_queue.append((photo_path, unmatched_dir / photo_path.name, True, None))
             unmatched_photos_count += 1
+
+    # TQDM Bar 3: Copying/Moving files
+    generated_copies_count = 0
+    moved_sources = set()
+
+    if not args.dry_run:
+        for src, dest, is_unmatched, gcp_id in tqdm(copy_queue, desc="Copying/Moving Photos"):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+
+            # Always copy to ensure we don't break if a photo matches multiple GCPs
+            shutil.copy2(src, dest)
+            if args.copy_mode == 'move':
+                moved_sources.add(src)
+
+            if not is_unmatched and gcp_id is not None:
+                matched_dict[gcp_id].append(src.name)
+                generated_copies_count += 1
+
+        # Clean up source files if in move mode
+        if args.copy_mode == 'move':
+            for src in moved_sources:
+                if src.exists():
+                    src.unlink()
+    else:
+        # Just populate matched_dict based on queue for dry-run report
+        for src, dest, is_unmatched, gcp_id in copy_queue:
+            if not is_unmatched and gcp_id is not None:
+                matched_dict[gcp_id].append(src.name)
+                generated_copies_count += 1
 
     # Update DataFrame with results
     matched_gcps_count = 0
@@ -201,19 +297,33 @@ def main():
     # Export Report
     today_str = datetime.now().strftime("%Y%m%d")
     report_path = output_dir / f"RawGCP_{today_str}.xlsx"
-    gcp_df.to_excel(report_path, index=False)
+
+    if not args.dry_run:
+        gcp_df.to_excel(report_path, index=False)
 
     # Print summary
-    print("\n" + "="*40)
-    print(" SUMMARY")
-    print("="*40)
-    print(f"Total GCPs processed        : {len(gcp_df)}")
-    print(f"GCPs with matched photos    : {matched_gcps_count}")
-    print(f"Total photos processed      : {total_photos}")
-    print(f"Photos matched to GCPs      : {photos_matched_count}")
-    print(f"Unmatched photos            : {unmatched_photos_count}")
-    print("="*40)
-    print(f"Report exported to: {report_path}")
+    points_no_photos = len(gcp_df) - matched_gcps_count
+
+    print("\n" + "="*60)
+    print(" SUMMARY REPORT")
+    print("="*60)
+    print(f"Total GCP Points Loaded         : {pre_dedup_count}")
+    print(f"Duplicate Points Removed        : {dedup_removed}")
+    print(f"Final GCP Points Processed      : {len(gcp_df)}")
+    print("-" * 60)
+    print(f"Total Photos Scanned            : {total_photos}")
+    print(f"Points with Matching Photos     : {matched_gcps_count}")
+    print(f"Points with ZERO Photos         : {points_no_photos}")
+    print("-" * 60)
+    print(f"Matched Photos Count (Unique)   : {photos_matched_count}")
+    print(f"Matched Photos (Total Copies)   : {generated_copies_count}")
+    print(f"Unmatched Photos Count          : {unmatched_photos_count}")
+    print("="*60)
+    if args.dry_run:
+        print("Dry run enabled. No report exported.")
+    else:
+        print(f"Report exported to:\n  {report_path.resolve()}")
+    print("="*60)
 
 if __name__ == "__main__":
     main()
