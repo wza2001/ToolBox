@@ -5,32 +5,37 @@ import math
 from pathlib import Path
 from datetime import datetime
 import shutil
-import exifread
 from geopy.distance import geodesic
 from tqdm import tqdm
+from PIL import Image
+from PIL.ExifTags import GPSTAGS, TAGS
+from pillow_heif import register_heif_opener
+
+# Enable HEIC support in Pillow
+register_heif_opener()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="GCP-Photo Matching Tool")
-    parser.add_argument("-e", "--excel-dir", dest="excel_dir", type=str, required=True, help="Path to the folder containing GCP Excel files (.xlsx, .xls).")
-    parser.add_argument("-p", "--photo-dir", dest="photo_dir", type=str, required=True, help="Path to the folder containing aerial/ground photos.")
-    parser.add_argument("-o", "--output-dir", dest="output_dir", type=str, default="./GCP_Photo_Output", help="Path where organized folders and reports will be saved.")
-    parser.add_argument("-b", "--buffer", dest="buffer_distance", type=float, default=50.0, help="Buffer radius in meters for spatial matching (default: 50.0).")
+    # Restore original argument names for backwards compatibility, but keep shorthand options
+    parser.add_argument("-e", "--excel_dir", dest="excel_dir", type=str, required=True, help="Path to the folder containing GCP Excel files (.xlsx, .xls).")
+    parser.add_argument("-p", "--photo_dir", dest="photo_dir", type=str, required=True, help="Path to the folder containing aerial/ground photos.")
+    parser.add_argument("-o", "--output_dir", dest="output_dir", type=str, default="./GCP_Photo_Output", help="Path where organized folders and reports will be saved.")
+    parser.add_argument("-b", "--buffer_distance", dest="buffer_distance", type=float, default=50.0, help="Buffer radius in meters for spatial matching (default: 50.0).")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="Run the spatial analysis without copying or modifying files.")
     parser.add_argument("--copy-mode", dest="copy_mode", choices=['copy', 'move'], default='copy', help="Choose whether to duplicate photos into GCP folders or move them.")
     parser.add_argument("--force", action="store_true", help="Suppress interactive warning if output_dir already exists.")
     return parser.parse_args()
 
-def dms_to_decimal(tags, ref_tag, val_tag):
-    if ref_tag not in tags or val_tag not in tags:
+def dms_to_decimal(val, ref):
+    if not val or not ref:
         return None
     try:
-        ref = tags[ref_tag].values
-        val = tags[val_tag].values
+        d, m, s = val
 
-        # Guard against zero division
-        d = float(val[0].num) / float(val[0].den) if val[0].den != 0 else 0
-        m = float(val[1].num) / float(val[1].den) if val[1].den != 0 else 0
-        s = float(val[2].num) / float(val[2].den) if val[2].den != 0 else 0
+        # PIL IFDRational handling
+        d = float(d) if hasattr(d, 'real') else float(d[0]) / float(d[1])
+        m = float(m) if hasattr(m, 'real') else float(m[0]) / float(m[1])
+        s = float(s) if hasattr(s, 'real') else float(s[0]) / float(s[1])
 
         decimal = d + (m / 60.0) + (s / 3600.0)
         if ref in ['S', 'W']:
@@ -41,11 +46,23 @@ def dms_to_decimal(tags, ref_tag, val_tag):
 
 def get_gps_from_exif(image_path):
     try:
-        with open(image_path, 'rb') as f:
-            tags = exifread.process_file(f, details=False)
+        with Image.open(image_path) as img:
+            exif = img.getexif()
+            if not exif:
+                return None, None
 
-            lat = dms_to_decimal(tags, 'GPS GPSLatitudeRef', 'GPS GPSLatitude')
-            lon = dms_to_decimal(tags, 'GPS GPSLongitudeRef', 'GPS GPSLongitude')
+            gps_info = exif.get_ifd(0x8825) # 0x8825 is the GPS IFD
+
+            if not gps_info:
+                return None, None
+
+            gps_tags = {}
+            for tag, value in gps_info.items():
+                decoded = GPSTAGS.get(tag, tag)
+                gps_tags[decoded] = value
+
+            lat = dms_to_decimal(gps_tags.get('GPSLatitude'), gps_tags.get('GPSLatitudeRef'))
+            lon = dms_to_decimal(gps_tags.get('GPSLongitude'), gps_tags.get('GPSLongitudeRef'))
 
             if lat is not None and lon is not None:
                 return lat, lon
@@ -128,18 +145,23 @@ def check_preflight(excel_dir, photo_dir, output_dir, force):
         sys.exit(1)
 
     # 3. Check for valid image files
-    photo_extensions = {".jpg", ".jpeg"}
+    photo_extensions = {".jpg", ".jpeg", ".heic", ".heif"}
     photos = [p for p in photo_dir.rglob("*") if p.is_file() and p.suffix.lower() in photo_extensions]
     if not photos:
-        print(f"Error: No valid image files (.jpg, .jpeg) found in '{photo_dir}'.")
+        print(f"Error: No valid image files (.jpg, .jpeg, .heic, .heif) found in '{photo_dir}'.")
         sys.exit(1)
 
     # 4. Prompt if output_dir exists and is non-empty
     if output_dir.exists() and any(output_dir.iterdir()) and not force:
-        response = input(f"Warning: Output directory '{output_dir}' already exists and is non-empty.\nDo you want to overwrite/append? [y/N]: ")
-        if response.lower() not in ['y', 'yes']:
-            print("Operation aborted by user.")
-            sys.exit(0)
+        # Check if we're connected to a terminal to avoid hanging automated scripts
+        if sys.stdin.isatty():
+            response = input(f"Warning: Output directory '{output_dir}' already exists and is non-empty.\nDo you want to overwrite/append? [y/N]: ")
+            if response.lower() not in ['y', 'yes']:
+                print("Operation aborted by user.")
+                sys.exit(0)
+        else:
+            print(f"Error: Output directory '{output_dir}' already exists and is non-empty. Use --force to overwrite in automated environments.")
+            sys.exit(1)
 
     return excel_files, photos
 
