@@ -26,6 +26,28 @@ def parse_args():
     parser.add_argument("--force", action="store_true", help="Suppress interactive warning if output_dir already exists.")
     return parser.parse_args()
 
+def parse_datetime(val):
+    if pd.isna(val):
+        return None
+
+    if isinstance(val, pd.Timestamp):
+        dt = val.to_pydatetime()
+    elif isinstance(val, datetime):
+        dt = val
+    else:
+        try:
+            # Handle potential string formats, replacing / with - for standard parsing
+            val_str = str(val).replace('/', '-')
+            dt = pd.to_datetime(val_str).to_pydatetime()
+        except Exception:
+            return None
+
+    # Make naive
+    if dt and dt.tzinfo:
+        dt = dt.replace(tzinfo=None)
+
+    return dt
+
 def dms_to_decimal(val, ref):
     if not val or not ref:
         return None
@@ -43,6 +65,35 @@ def dms_to_decimal(val, ref):
         return decimal
     except Exception:
         return None
+
+def get_photo_datetime(image_path):
+    try:
+        with Image.open(image_path) as img:
+            exif = img.getexif()
+            if not exif:
+                return None
+
+            # 36867 is DateTimeOriginal, 306 is DateTime
+            dt_str = exif.get(36867) or exif.get(306)
+            if not dt_str:
+                return None
+
+            # EXIF format is usually "YYYY:MM:DD HH:MM:SS"
+            dt_str = str(dt_str).strip()
+            try:
+                return datetime.strptime(dt_str, "%Y:%m:%d %H:%M:%S")
+            except ValueError:
+                # Try parsing as standard ISO string if the usual format fails
+                try:
+                    dt = pd.to_datetime(dt_str.replace(':', '-', 2)).to_pydatetime()
+                    if dt.tzinfo:
+                        dt = dt.replace(tzinfo=None)
+                    return dt
+                except Exception:
+                    return None
+    except Exception:
+        pass
+    return None
 
 def get_gps_from_exif(image_path):
     try:
@@ -74,9 +125,23 @@ def process_excel_files(excel_files):
     df_list = []
 
     # Progress Bar 1: Reading and deduplicating Excel files
-    for f in tqdm(excel_files, desc="Reading Excel Files"):
+    for f in tqdm(excel_files, desc="Reading Excel/CSV Files"):
         try:
-            df = pd.read_excel(f)
+            if f.suffix.lower() == '.csv':
+                # Try different encodings for CSV
+                success = False
+                for enc in ['utf-8-sig', 'gbk', 'latin1']:
+                    try:
+                        df = pd.read_csv(f, encoding=enc)
+                        success = True
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if not success:
+                    print(f"Failed to read {f}: Unknown encoding")
+                    continue
+            else:
+                df = pd.read_excel(f)
             df_list.append(df)
         except Exception as e:
             print(f"Failed to read {f}: {e}")
@@ -123,6 +188,10 @@ def process_excel_files(excel_files):
 
     merged_df = merged_df[core_cols].copy()
 
+    # Parse the 'Recorded at' column into standard Python datetime (naive)
+    if 'Recorded at' in merged_df.columns:
+        merged_df['Recorded at'] = merged_df['Recorded at'].apply(parse_datetime)
+
     # Initialize tracking columns
     merged_df['PhotoCheck_Or_Not'] = 'No'
     merged_df['Matched_Photos'] = ''
@@ -138,10 +207,14 @@ def check_preflight(excel_dir, photo_dir, output_dir, force):
         print(f"Error: Photo directory '{photo_dir}' does not exist or is not a directory.")
         sys.exit(1)
 
-    # 2. Check for Excel files
-    excel_files = list(excel_dir.glob("*.xlsx")) + list(excel_dir.glob("*.xls"))
+    # 2. Check for Excel/CSV files
+    excel_files = [
+        f for f in list(excel_dir.glob("*.xlsx")) + list(excel_dir.glob("*.xls")) + list(excel_dir.glob("*.csv"))
+        if not f.name.startswith("~$")
+    ]
+
     if not excel_files:
-        print(f"Error: No Excel files (.xlsx, .xls) found in '{excel_dir}'.")
+        print(f"Error: No valid Excel/CSV files (.xlsx, .xls, .csv) found in '{excel_dir}'.")
         sys.exit(1)
 
     # 3. Check for valid image files
