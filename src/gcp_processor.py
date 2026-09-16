@@ -77,8 +77,19 @@ def get_photo_datetime(image_path):
             if not exif:
                 return None
 
-            # 36867 is DateTimeOriginal, 306 is DateTime
-            dt_str = exif.get(36867) or exif.get(306)
+            # Read DateTimeOriginal (tag 36867) from the Exif SubIFD
+            dt_str = None
+            try:
+                sub_ifd = exif.get_ifd(0x8769)
+                if sub_ifd and 36867 in sub_ifd:
+                    dt_str = sub_ifd[36867]
+            except Exception:
+                pass
+
+            # Fall back to root tags 36867 or 306
+            if not dt_str:
+                dt_str = exif.get(36867) or exif.get(306)
+
             if not dt_str:
                 return None
 
@@ -271,8 +282,6 @@ def main():
 
     unmatched_dir = output_dir / "Inconnect_photo"
     no_gps_dir = unmatched_dir / "No_GPS"
-    out_of_range_dir = unmatched_dir / "Out_of_Range"
-    time_mismatch_dir = unmatched_dir / "Time_Mismatch"
     manual_calibration_dir = output_dir / "Manual_Calibration"
 
     gcp_df, pre_dedup_count, post_dedup_count = process_excel_files(excel_files)
@@ -282,8 +291,6 @@ def main():
         output_dir.mkdir(parents=True, exist_ok=True)
         unmatched_dir.mkdir(parents=True, exist_ok=True)
         no_gps_dir.mkdir(parents=True, exist_ok=True)
-        out_of_range_dir.mkdir(parents=True, exist_ok=True)
-        time_mismatch_dir.mkdir(parents=True, exist_ok=True)
         manual_calibration_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Strict Folder Scaffolding
@@ -295,14 +302,16 @@ def main():
     total_photos = len(photos)
     status_counts = {
         "NO_GPS": 0,
-        "OUT_OF_RANGE": 0,
-        "TIME_MISMATCH": 0,
-        "MATCHED": 0,
+        "UNMATCHED": 0,
+        "HIGH": 0,
+        "SPATIAL_ONLY": 0,
+        "TEMPORAL_ONLY": 0,
         "CONFLICT": 0
     }
 
     matched_dict = {row['ID']: [] for _, row in gcp_df.iterrows()}
     conflict_dict = {row['ID']: [] for _, row in gcp_df.iterrows()}
+    match_basis_dict = {row['ID']: [] for _, row in gcp_df.iterrows()}
 
     copy_queue = [] # list of tuples: (source_path, dest_path)
 
@@ -310,65 +319,69 @@ def main():
         lat, lon = get_gps_from_exif(photo_path)
         photo_time = get_photo_datetime(photo_path)
 
-        if lat is None or lon is None:
-            status_counts["NO_GPS"] += 1
-            copy_queue.append((photo_path, no_gps_dir / photo_path.name))
-            continue
+        has_gps = lat is not None and lon is not None
 
-        spatial_candidates = []
+        candidates = []
 
-        # Find spatial candidates
+        # Find candidates (OR logic)
         for idx, row in gcp_df.iterrows():
             gcp_lat = row['latitude']
             gcp_lon = row['longitude']
-
-            if pd.isna(gcp_lat) or pd.isna(gcp_lon):
-                continue
-
-            try:
-                gcp_lat = float(gcp_lat)
-                gcp_lon = float(gcp_lon)
-            except ValueError:
-                continue
-
-            dist = geodesic((lat, lon), (gcp_lat, gcp_lon)).meters
-            if dist <= args.buffer_distance:
-                spatial_candidates.append(row)
-
-        if not spatial_candidates:
-            status_counts["OUT_OF_RANGE"] += 1
-            copy_queue.append((photo_path, out_of_range_dir / photo_path.name))
-            continue
-
-        # Evaluate temporal criteria among spatial candidates
-        valid_candidates = []
-        for row in spatial_candidates:
             gcp_time = row['Recorded at']
-            if pd.isna(gcp_time) or photo_time is None:
-                # If either time is missing, we might assume it's valid to be safe,
-                # but to be strict based on the requirement, if they can't calculate dt, we skip or include?
-                # The task says: "calculate |Delta t|. Keep only candidates where |Delta t| <= time_window."
-                # If we don't have time, it can't satisfy this.
-                pass
-            else:
+
+            spatial_match = False
+            temporal_match = False
+
+            if has_gps and not pd.isna(gcp_lat) and not pd.isna(gcp_lon):
+                try:
+                    gcp_lat = float(gcp_lat)
+                    gcp_lon = float(gcp_lon)
+                    dist = geodesic((lat, lon), (gcp_lat, gcp_lon)).meters
+                    if dist <= args.buffer_distance:
+                        spatial_match = True
+                except ValueError:
+                    pass
+
+            if photo_time is not None and not pd.isna(gcp_time):
                 time_diff = abs((photo_time - gcp_time).total_seconds())
                 if time_diff <= args.time_window:
-                    valid_candidates.append(row)
+                    temporal_match = True
 
-        if not valid_candidates:
-            status_counts["TIME_MISMATCH"] += 1
-            copy_queue.append((photo_path, time_mismatch_dir / photo_path.name))
+            if spatial_match and temporal_match:
+                candidates.append({'row': row, 'tier': 1, 'tier_name': 'HIGH', 'basis': 'Both'})
+            elif spatial_match:
+                candidates.append({'row': row, 'tier': 2, 'tier_name': 'SPATIAL_ONLY', 'basis': 'Spatial_Only'})
+            elif temporal_match:
+                candidates.append({'row': row, 'tier': 3, 'tier_name': 'TEMPORAL_ONLY', 'basis': 'Temporal_Only'})
+
+        if not candidates:
+            if not has_gps:
+                status_counts["NO_GPS"] += 1
+                copy_queue.append((photo_path, no_gps_dir / photo_path.name))
+            else:
+                status_counts["UNMATCHED"] += 1
+                copy_queue.append((photo_path, unmatched_dir / photo_path.name))
             continue
 
         # Arbitration
-        if len(valid_candidates) == 1:
-            gcp_id = valid_candidates[0]['ID']
+        # Find best tier
+        best_tier = min(c['tier'] for c in candidates)
+        best_candidates = [c for c in candidates if c['tier'] == best_tier]
+
+        if len(best_candidates) == 1:
+            best = best_candidates[0]
+            gcp_id = best['row']['ID']
+            tier_name = best['tier_name']
+            basis = best['basis']
+
             matched_dict[gcp_id].append(photo_path.name)
-            status_counts["MATCHED"] += 1
+            match_basis_dict[gcp_id].append(f"{photo_path.name} ({basis})")
+            status_counts[tier_name] += 1
+
             gcp_folder = output_dir / f"GCP_{gcp_id}"
             copy_queue.append((photo_path, gcp_folder / photo_path.name))
         else:
-            gcp_ids = [row['ID'] for row in valid_candidates]
+            gcp_ids = [c['row']['ID'] for c in best_candidates]
             status_counts["CONFLICT"] += 1
             copy_queue.append((photo_path, manual_calibration_dir / photo_path.name))
             for cid in gcp_ids:
@@ -388,16 +401,19 @@ def main():
     gcp_df['Matched_Count'] = 0
     gcp_df['Matched_Photos'] = ''
     gcp_df['Conflict_Photos'] = ''
+    gcp_df['Match_Basis'] = ''
 
     for idx, row in gcp_df.iterrows():
         gcp_id = row['ID']
         m_photos = matched_dict[gcp_id]
         c_photos = conflict_dict[gcp_id]
+        basis_list = match_basis_dict[gcp_id]
 
         gcp_df.at[idx, 'Matched_Count'] = len(m_photos)
 
         if m_photos:
             gcp_df.at[idx, 'Matched_Photos'] = ', '.join(m_photos)
+            gcp_df.at[idx, 'Match_Basis'] = ', '.join(basis_list)
             gcp_df.at[idx, 'PhotoCheck_Or_Not'] = 'Yes'
             matched_gcps_count += 1
         elif c_photos:
@@ -425,10 +441,11 @@ def main():
     print("-" * 60)
     print(f"Total Photos Scanned            : {total_photos}")
     print(f"Photos NO_GPS                   : {status_counts['NO_GPS']}")
-    print(f"Photos OUT_OF_RANGE             : {status_counts['OUT_OF_RANGE']}")
-    print(f"Photos TIME_MISMATCH            : {status_counts['TIME_MISMATCH']}")
-    print(f"Photos MATCHED (Unique GCP)     : {status_counts['MATCHED']}")
-    print(f"Photos CONFLICT (>1 Valid GCP)  : {status_counts['CONFLICT']}")
+    print(f"Photos UNMATCHED                : {status_counts['UNMATCHED']}")
+    print(f"Photos HIGH (Both Match)        : {status_counts['HIGH']}")
+    print(f"Photos SPATIAL_ONLY             : {status_counts['SPATIAL_ONLY']}")
+    print(f"Photos TEMPORAL_ONLY            : {status_counts['TEMPORAL_ONLY']}")
+    print(f"Photos CONFLICT (>1 Best Tie)   : {status_counts['CONFLICT']}")
     print("-" * 60)
     print(f"Points with Matching Photos     : {matched_gcps_count}")
     print(f"Points with ZERO Photos         : {points_no_photos}")
