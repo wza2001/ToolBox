@@ -37,13 +37,16 @@ def parse_datetime(val):
         dt = val
     else:
         try:
-            # Handle potential string formats, replacing / with - for standard parsing
-            val_str = str(val).replace('/', '-')
-            dt = pd.to_datetime(val_str).to_pydatetime()
+            # 自动解析 ISO 8601 格式（包含 'Z' 或时区偏移）
+            ts = pd.to_datetime(val)
+            if ts.tzinfo is not None:
+                # 转为阿布扎比当地时区 UTC+4 (Asia/Dubai) 并剥离时区属性
+                dt = ts.tz_convert('Asia/Dubai').tz_localize(None).to_pydatetime()
+            else:
+                dt = ts.to_pydatetime()
         except Exception:
             return None
 
-    # Make naive
     if dt and dt.tzinfo:
         dt = dt.replace(tzinfo=None)
 
