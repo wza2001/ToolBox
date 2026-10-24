@@ -20,7 +20,7 @@ def parse_args():
     parser.add_argument("-e", "--excel_dir", dest="excel_dir", type=str, required=True, help="Path to the folder containing GCP Excel files (.xlsx, .xls).")
     parser.add_argument("-p", "--photo_dir", dest="photo_dir", type=str, required=True, help="Path to the folder containing aerial/ground photos.")
     parser.add_argument("-o", "--output_dir", dest="output_dir", type=str, default="./GCP_Photo_Output", help="Path where organized folders and reports will be saved.")
-    parser.add_argument("-b", "--buffer_distance", dest="buffer_distance", type=float, default=50.0, help="Buffer radius in meters for spatial matching (default: 50.0).")
+    parser.add_argument("-b", "--buffer_distance", dest="buffer_distance", type=float, default=20.0, help="Buffer radius in meters for spatial matching (default: 50.0).")
     parser.add_argument("-t", "--time-window", dest="time_window", type=int, default=300, help="Maximum allowed time difference in seconds between photo and GCP timestamp.")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="Run the spatial analysis without copying or modifying files.")
     parser.add_argument("--copy-mode", dest="copy_mode", choices=['copy', 'move'], default='copy', help="Choose whether to duplicate photos into GCP folders or move them.")
@@ -351,7 +351,7 @@ def main():
                 candidates.append({'row': row, 'tier': 1, 'tier_name': 'HIGH', 'basis': 'Both'})
             elif spatial_match:
                 candidates.append({'row': row, 'tier': 2, 'tier_name': 'SPATIAL_ONLY', 'basis': 'Spatial_Only'})
-            elif temporal_match:
+            elif temporal_match and not has_gps:  # 仅当照片无 GPS 时，才降级使用时间推断
                 candidates.append({'row': row, 'tier': 3, 'tier_name': 'TEMPORAL_ONLY', 'basis': 'Temporal_Only'})
 
         if not candidates:
